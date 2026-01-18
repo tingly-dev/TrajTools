@@ -22,6 +22,7 @@ Example:
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from enum import Enum
@@ -729,9 +730,9 @@ def main(
         "-q",
         help="Query string to match against the first user message of a trajectory (if not specified, returns first trajectory found)",
     ),
-    path: str = typer.Argument(
-        ...,
-        help="Path to a JSONL file or directory containing JSONL files",
+    path: Optional[str] = typer.Argument(
+        None,
+        help="Path to a JSONL file or directory containing JSONL files (required unless --project is specified)",
     ),
     recursive: bool = typer.Option(
         True,
@@ -803,7 +804,8 @@ def main(
     line (in JSONL format) or as a system_config field (in JSON format).
 
     Example:
-        extract_traj_for_cc "Summarize the architecture" tmp/
+        extract_traj_for_cc --query "Summarize the architecture" tmp/
+        extract_traj_for_cc --project myproject
     """
     # Load system prompt for prepending to trajectory output
     system_config = None
@@ -814,8 +816,41 @@ def main(
             system_config = extract_system_config(data)
             typer.echo(f"Loaded system prompt from: {prompt_path}", err=True)
 
-    # Resolve path (use --project if provided, otherwise use path argument)
-    input_path = Path(project if project else path).resolve()
+    # Resolve path: use --project if provided, otherwise use path argument
+    # If neither is provided, raise an error
+    if not project and not path:
+        typer.echo("Error: Either --project/-p or path argument must be specified", err=True)
+        raise typer.Exit(1)
+
+    # Determine the input path string
+    input_path_str = project if project else path
+
+    # On Windows, a path starting with \ but without a drive letter (e.g., '\foo')
+    # gets treated as absolute relative to drive root (e.g., 'D:\foo').
+    # We want to treat these as relative paths instead.
+    # Check the raw input string before creating Path object
+    if os.name == 'nt':  # Windows
+        # Check if path starts with \ or / but doesn't have a drive letter
+        has_drive_letter = len(input_path_str) >= 2 and input_path_str[0].isalpha() and input_path_str[1] == ':'
+        is_unc = input_path_str.startswith('\\\\')
+        starts_with_slash = input_path_str.startswith('\\') or input_path_str.startswith('/')
+
+        if starts_with_slash and not has_drive_letter and not is_unc:
+            # This is a path like '\foo' - treat as relative, not absolute
+            # Strip the leading slash and prepend current working directory
+            input_path = Path.cwd() / input_path_str.lstrip('\\/')
+        else:
+            input_path = Path(input_path_str)
+    else:
+        input_path = Path(input_path_str)
+
+    # Convert to absolute path: if still relative, prepend current working directory
+    if not input_path.is_absolute():
+        input_path = Path.cwd() / input_path
+
+    # Resolve to remove any .. or . components
+    input_path = input_path.resolve()
+
     typer.echo(f"Searching in: {input_path}", err=True)
 
     # Find JSONL files
