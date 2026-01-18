@@ -26,9 +26,15 @@ import re
 import sys
 from enum import Enum
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 import typer
+
+from preprocessing import (
+    extract_system_config,
+    get_default_system_prompt_path,
+    load_system_prompt,
+)
 
 app = typer.Typer(
     name="extract_traj_for_cc",
@@ -55,6 +61,11 @@ class OutputFormat(str, Enum):
 ERR_NO_MATCH = "No matching trajectory found"
 ERR_INVALID_PATH = "Invalid path: {path}"
 ERR_NO_JSONL_FILES = "No JSONL files found in {path}"
+
+
+# ============================================================================
+# JSONL File Finding
+# ============================================================================
 
 
 def find_jsonl_files(path: Path, recursive: bool = True) -> List[Path]:
@@ -219,7 +230,8 @@ def is_user_message(msg: dict[str, Any]) -> bool:
 
     A user message is considered a trajectory start point iff:
     - type is "user"
-    - isMeta is not true (filter out metadata/system messages)
+    - isMeta is not true, OR if isMeta is true, the message has substantial content
+      (handles cases where legitimate user messages were incorrectly flagged as meta)
     - message.content doesn't contain a non-empty tool_use_id field
     - message.content is not empty
     - is not a session summary message (session summaries appear mid-trajectory)
@@ -234,8 +246,18 @@ def is_user_message(msg: dict[str, Any]) -> bool:
         return False
 
     # Filter out meta messages (system-generated messages like image placeholders)
-    if msg.get("isMeta", False):
-        return False
+    # However, if the message has substantial content (>50 chars), treat it as valid
+    # This handles cases where legitimate user messages were incorrectly flagged as meta
+    is_meta = msg.get("isMeta", False)
+    if is_meta:
+        content_text = extract_message_content(msg).strip()
+        # Only filter out meta messages that are short (likely placeholders)
+        if len(content_text) > 50:
+            # Has substantial content despite isMeta=True flag, treat as valid
+            pass  # Continue to other checks
+        else:
+            # Short meta message, likely a placeholder, filter it out
+            return False
 
     # Filter out session summary messages (they appear mid-trajectory, not as boundaries)
     if is_session_summary_message(msg):
@@ -406,14 +428,13 @@ def is_session_summary_message(msg: dict[str, Any]) -> bool:
     # Count words (split by whitespace)
     word_count = len(content.split())
 
-    # A message is considered a session summary if:
+    # A message is considered a session summary ONLY if:
     # - It has continuation indicator AND is more than 300 words
-    # OR
-    # - It's extremely long (more than 500 words) even without explicit indicator
+    # (Removed the "extremely long" check as it causes false positives on long user messages)
     if has_continuation_indicator:
         return word_count > 300
 
-    return word_count > 500
+    return False
 
 
 def select_best_trajectory(
@@ -584,24 +605,105 @@ def extract_trajectories(
 
 def format_output(
     trajectories: List[List[dict[str, Any]]],
-    format_type: OutputFormat
+    format_type: OutputFormat,
+    system_config: Optional[Dict[str, Any]] = None
 ) -> str:
     """Format trajectories for output.
 
     Args:
         trajectories: List of trajectories to format
         format_type: Output format type
+        system_config: Optional system config to prepend (system, tools, thinking)
 
     Returns:
         Formatted output string
     """
     if format_type == OutputFormat.json:
-        # Output as JSON array
+        # Output as JSON array with system config prepended if provided
+        if system_config:
+            output_dict = {"system_config": system_config, "trajectories": trajectories}
+            return json.dumps(output_dict, indent=2, ensure_ascii=False)
         return json.dumps(trajectories, indent=2, ensure_ascii=False)
 
     elif format_type == OutputFormat.jsonl:
         # Output as JSONL (one JSON object per line)
         lines: List[str] = []
+        # Prepend system config as a special user message if provided
+        # (claude-code-log doesn't support 'system' type, so we use 'user' with a marker)
+        if system_config:
+            # Use a clearly identifiable UUID for the system config
+            system_uuid = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+            # Get the parent UUID from the first trajectory message if available
+            parent_uuid = "00000000-0000-0000-0000-000000000000"  # root parent
+            if trajectories and trajectories[0]:
+                first_msg = trajectories[0][0]
+                parent_uuid = first_msg.get("parentUuid", parent_uuid)
+
+            # Create a distinctive system prompt marker
+            system_marker = """╔═══════════════════════════════════════════════════════════════════════════════╗
+║                              SYSTEM CONFIGURATION                                    ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+
+This file includes the system prompt, tools, and thinking configuration that was used
+ during this conversation. The full config is also embedded in this message for
+ programmatic access (see _systemConfig field below).
+
+───────────────────────────────────────────────────────────────────────────────────────────
+SYSTEM PROMPT:
+───────────────────────────────────────────────────────────────────────────────────────────
+
+""" + system_config.get("system", "") + """
+
+───────────────────────────────────────────────────────────────────────────────────────────
+TOOLS:
+───────────────────────────────────────────────────────────────────────────────────────────
+
+""" + "\n".join([
+    f"• {tool.get('name', 'unknown')}: {tool.get('description', '')[:80]}..."
+    for tool in system_config.get("tools", [])[:10]
+]) + (f"\n... and {len(system_config.get('tools', [])) - 10} more tools" if len(system_config.get('tools', [])) > 10 else "") + """
+
+───────────────────────────────────────────────────────────────────────────────────────────
+"""
+
+            thinking = system_config.get("thinking")
+            if thinking:
+                system_marker += f"""THINKING CONFIG:
+───────────────────────────────────────────────────────────────────────────────────────────
+
+• Budget Tokens: {thinking.get('budget_tokens', 'N/A')}
+• Type: {thinking.get('type', 'N/A')}
+
+"""
+
+            system_marker += "╔═══════════════════════════════════════════════════════════════════════════════╗"
+
+            # Format system config as a user-type message for claude-code-log compatibility
+            system_msg = {
+                "parentUuid": parent_uuid,
+                "isSidechain": False,
+                "userType": "system",
+                "cwd": trajectories[0][0].get("cwd", "/") if trajectories and trajectories[0] else "/",
+                "sessionId": trajectories[0][0].get("sessionId", "system") if trajectories and trajectories[0] else "system",
+                "version": trajectories[0][0].get("version", "1.0.0") if trajectories and trajectories[0] else "1.0.0",
+                "gitBranch": trajectories[0][0].get("gitBranch", "main") if trajectories and trajectories[0] else "main",
+                "slug": "system-config",
+                "type": "user",  # Use 'user' type so claude-code-log will render it
+                "message": {
+                    "role": "user",
+                    "content": system_marker,
+                },
+                "uuid": system_uuid,
+                "timestamp": trajectories[0][0].get("timestamp", "1970-01-01T00:00:00.000Z") if trajectories and trajectories[0] else "1970-01-01T00:00:00.000Z",
+                "thinkingMetadata": None,
+                "todos": None,
+                # Store the full system config (including tools, thinking) for programmatic access
+                "_systemConfig": system_config
+            }
+            lines.append(json.dumps(system_msg, ensure_ascii=False))
+            # Update the first trajectory message's parentUuid to point to the system message
+            if trajectories and trajectories[0]:
+                trajectories[0][0]["parentUuid"] = system_uuid
         for trajectory in trajectories:
             for msg in trajectory:
                 lines.append(json.dumps(msg, ensure_ascii=False))
@@ -676,6 +778,16 @@ def main(
         "-o",
         help="Write output to file instead of stdout",
     ),
+    no_system_prompt: bool = typer.Option(
+        False,
+        "--no-system-prompt",
+        help="Disable loading system prompt from resource/cc_prompt.json",
+    ),
+    system_config_output: Optional[str] = typer.Option(
+        None,
+        "--system-config-output",
+        help="Export system config (system prompt + tools) to specified JSON file",
+    ),
 ):
     """
     Extract Claude Code Q&A trajectories from JSONL log files.
@@ -684,9 +796,21 @@ def main(
     valid user message or end of file. Valid user messages exclude meta messages,
     tool use messages, session summaries, and system-generated content.
 
+    System prompt and tools are automatically prepended to the output as the first
+    line (in JSONL format) or as a system_config field (in JSON format).
+
     Example:
         extract_traj_for_cc "Summarize the architecture" tmp/
     """
+    # Load system prompt for prepending to trajectory output
+    system_config = None
+    if not no_system_prompt:
+        prompt_path = get_default_system_prompt_path()
+        data = load_system_prompt(prompt_path)
+        if data:
+            system_config = extract_system_config(data)
+            typer.echo(f"Loaded system prompt from: {prompt_path}", err=True)
+
     # Resolve path
     input_path = Path(path).resolve()
 
@@ -706,6 +830,7 @@ def main(
         )
 
         for trajectory in trajectories:
+            # System config is prepended during output formatting, not added to trajectory data
             all_matches.append((file_path, trajectory))
 
         # Continue searching all files for more matches
@@ -726,12 +851,22 @@ def main(
     else:
         trajectories_to_output = trajectories_only
 
-    # Format output
-    output = format_output(trajectories_to_output, output_format)
+    # Format output (system config is prepended to the trajectory)
+    output = format_output(trajectories_to_output, output_format, system_config)
 
     # Add separator after verbose selection output
     if not find_all and len(trajectories_only) > 1 and not output_file:
         typer.echo("", err=True)
+
+    # Export system config if requested
+    if system_config and system_config_output:
+        try:
+            with open(system_config_output, "w", encoding="utf-8") as f:
+                json.dump(system_config, f, indent=2, ensure_ascii=False)
+            typer.echo(f"Exported system config to {system_config_output}", err=True)
+        except Exception as e:
+            typer.echo(f"Error: Failed to write system config to {system_config_output}: {e}", err=True)
+            raise typer.Exit(1)
 
     # Write output
     if output_file:
