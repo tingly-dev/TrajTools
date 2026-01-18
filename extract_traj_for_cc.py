@@ -640,43 +640,32 @@ def format_output(
                 parent_uuid = first_msg.get("parentUuid", parent_uuid)
 
             # Create a distinctive system prompt marker
-            system_marker = """╔═══════════════════════════════════════════════════════════════════════════════╗
-║                              SYSTEM CONFIGURATION                                    ║
-╚═══════════════════════════════════════════════════════════════════════════════╝
+            system_marker = """════════════════════════════════════════════════════════════════════════════
+                            SYSTEM CONFIGURATION                                   
+═══════════════════════════════════════════════════════════════════════════ 
 
 This file includes the system prompt, tools, and thinking configuration that was used
  during this conversation. The full config is also embedded in this message for
  programmatic access (see _systemConfig field below).
 
-───────────────────────────────────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────────────
 SYSTEM PROMPT:
-───────────────────────────────────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────────────
 
 """ + system_config.get("system", "") + """
 
-───────────────────────────────────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────────────
 TOOLS:
-───────────────────────────────────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────────────
 
 """ + "\n".join([
-    f"• {tool.get('name', 'unknown')}: {tool.get('description', '')[:80]}..."
-    for tool in system_config.get("tools", [])[:10]
-]) + (f"\n... and {len(system_config.get('tools', [])) - 10} more tools" if len(system_config.get('tools', [])) > 10 else "") + """
-
-───────────────────────────────────────────────────────────────────────────────────────────
-"""
-
-            thinking = system_config.get("thinking")
-            if thinking:
-                system_marker += f"""THINKING CONFIG:
-───────────────────────────────────────────────────────────────────────────────────────────
-
-• Budget Tokens: {thinking.get('budget_tokens', 'N/A')}
-• Type: {thinking.get('type', 'N/A')}
+    f"• {tool.get('name', 'unknown')}: {tool.get('description', '')}"
+    for tool in system_config.get("tools", [])
+]) + """
 
 """
 
-            system_marker += "╔═══════════════════════════════════════════════════════════════════════════════╗"
+            system_marker += "════════════════════════════════════════════════════════════════════════════"
 
             # Format system config as a user-type message for claude-code-log compatibility
             system_msg = {
@@ -734,9 +723,11 @@ TOOLS:
 
 @app.command()
 def main(
-    query_string: str = typer.Argument(
-        ...,
-        help="Query string to match against the first user message of a trajectory",
+    query_string: Optional[str] = typer.Option(
+        None,
+        "--query",
+        "-q",
+        help="Query string to match against the first user message of a trajectory (if not specified, returns first trajectory found)",
     ),
     path: str = typer.Argument(
         ...,
@@ -788,6 +779,18 @@ def main(
         "--system-config-output",
         help="Export system config (system prompt + tools) to specified JSON file",
     ),
+    system_prompt_path: Optional[str] = typer.Option(
+        None,
+        "--system-prompt-path",
+        "-s",
+        help="Path to custom system prompt JSON file (default: resource/cc_prompt.json)",
+    ),
+    project: Optional[str] = typer.Option(
+        None,
+        "--project",
+        "-p",
+        help="Project directory (overrides path argument)",
+    ),
 ):
     """
     Extract Claude Code Q&A trajectories from JSONL log files.
@@ -805,14 +808,15 @@ def main(
     # Load system prompt for prepending to trajectory output
     system_config = None
     if not no_system_prompt:
-        prompt_path = get_default_system_prompt_path()
+        prompt_path = system_prompt_path if system_prompt_path else get_default_system_prompt_path()
         data = load_system_prompt(prompt_path)
         if data:
             system_config = extract_system_config(data)
             typer.echo(f"Loaded system prompt from: {prompt_path}", err=True)
 
-    # Resolve path
-    input_path = Path(path).resolve()
+    # Resolve path (use --project if provided, otherwise use path argument)
+    input_path = Path(project if project else path).resolve()
+    typer.echo(f"Searching in: {input_path}", err=True)
 
     # Find JSONL files
     files = find_jsonl_files(input_path, recursive=recursive)
