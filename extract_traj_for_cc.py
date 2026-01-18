@@ -734,9 +734,11 @@ TOOLS:
 
 @app.command()
 def main(
-    query_string: str = typer.Argument(
-        ...,
-        help="Query string to match against the first user message of a trajectory",
+    query_string: Optional[str] = typer.Option(
+        None,
+        "--query",
+        "-q",
+        help="Query string to match against the first user message of a trajectory (if not specified, returns first trajectory found)",
     ),
     path: str = typer.Argument(
         ...,
@@ -788,6 +790,18 @@ def main(
         "--system-config-output",
         help="Export system config (system prompt + tools) to specified JSON file",
     ),
+    system_prompt_path: Optional[str] = typer.Option(
+        None,
+        "--system-prompt-path",
+        "-s",
+        help="Path to custom system prompt JSON file (default: resource/cc_prompt.json)",
+    ),
+    project: Optional[str] = typer.Option(
+        None,
+        "--project",
+        "-p",
+        help="Project directory (overrides path argument)",
+    ),
 ):
     """
     Extract Claude Code Q&A trajectories from JSONL log files.
@@ -805,14 +819,15 @@ def main(
     # Load system prompt for prepending to trajectory output
     system_config = None
     if not no_system_prompt:
-        prompt_path = get_default_system_prompt_path()
+        prompt_path = system_prompt_path if system_prompt_path else get_default_system_prompt_path()
         data = load_system_prompt(prompt_path)
         if data:
             system_config = extract_system_config(data)
             typer.echo(f"Loaded system prompt from: {prompt_path}", err=True)
 
-    # Resolve path
-    input_path = Path(path).resolve()
+    # Resolve path (use --project if provided, otherwise use path argument)
+    input_path = Path(project if project else path).resolve()
+    typer.echo(f"Searching in: {input_path}", err=True)
 
     # Find JSONL files
     files = find_jsonl_files(input_path, recursive=recursive)
